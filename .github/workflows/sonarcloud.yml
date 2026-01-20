@@ -1,0 +1,146 @@
+
+name: Grilo SC Analysis for Java (Maven/Gradle)
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  sonar-analysis:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # DETECÇÃO INTELIGENTE
+      - name: Detect Project Type and Java Version
+        id: project_info
+        run: |
+          # 1. Procura Maven
+          POM_PATH=$(find . -maxdepth 3 -name "pom.xml" -not -path "*/target/*" | head -n 1)
+          
+          # 2. Procura Gradle
+          GRADLE_PATH=$(find . -maxdepth 3 -name "gradlew" -o -name "build.gradle" -o -name "build.gradle.kts" | head -n 1)
+
+          if [ -n "$POM_PATH" ]; then
+            echo "Build System: Maven detected at $POM_PATH"
+            echo "build_system=maven" >> $GITHUB_OUTPUT
+            echo "build_file=$POM_PATH" >> $GITHUB_OUTPUT
+            JAVA_VERSION=$(mvn -q -Dexec.executable=echo -Dexec.args='${maven.compiler.release}' --non-recursive exec:exec -f "$POM_PATH" | grep -o '^[0-9][0-9]*' || echo '17')
+          
+          elif [ -n "$GRADLE_PATH" ]; then
+            echo "Build System: Gradle detected at $GRADLE_PATH"
+            echo "build_system=gradle" >> $GITHUB_OUTPUT
+            if [[ "$GRADLE_PATH" == *"gradlew"* ]]; then
+               DIR=$(dirname "$GRADLE_PATH")
+               echo "gradle_wrapper_dir=$DIR" >> $GITHUB_OUTPUT
+            fi
+            JAVA_VERSION='17'
+          else
+             echo "::warning::Nenhum build system detectado."
+             echo "build_system=unknown" >> $GITHUB_OUTPUT
+             JAVA_VERSION='17'
+          fi
+          
+          echo "Java Version Selected: $JAVA_VERSION"
+          echo "java_version=$JAVA_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ steps.project_info.outputs.java_version }}
+          distribution: 'temurin'
+
+      # --- EXECUÇÃO MAVEN ---
+      - name: Maven Analysis (Full)
+        if: steps.project_info.outputs.build_system == 'maven'
+        id: maven_full
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -f ${{ steps.project_info.outputs.build_file }} -Dsonar.projectKey=grilo-org_20260120T192424_lukninja97_NodeExplorer -Dsonar.projectName=20260120T192424_lukninja97_NodeExplorer -Dsonar.host.url=https://sonarcloud.io -Dsonar.organization=grilo-org
+
+      - name: Maven Analysis (Fallback)
+        if: steps.project_info.outputs.build_system == 'maven' && steps.maven_full.outcome == 'failure'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          echo "::warning::Build Maven falhou. Tentando sem testes."
+          mvn -B verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -Dmaven.test.skip=true -f ${{ steps.project_info.outputs.build_file }} -Dsonar.projectKey=grilo-org_20260120T192424_lukninja97_NodeExplorer -Dsonar.projectName=20260120T192424_lukninja97_NodeExplorer -Dsonar.host.url=https://sonarcloud.io -Dsonar.organization=grilo-org
+
+      # --- EXECUÇÃO GRADLE (SUPER BLINDADA V4 - ANTI-TIMEOUT) ---
+      
+      # 1. TENTA COMPILAR (Smart Build: Debug > Release)
+      - name: Gradle Build (Smart Strategy)
+        if: steps.project_info.outputs.build_system == 'gradle'
+        id: gradle_build
+        continue-on-error: true
+        run: |
+          if [ -n "${{ steps.project_info.outputs.gradle_wrapper_dir }}" ]; then
+            cd ${{ steps.project_info.outputs.gradle_wrapper_dir }}
+            chmod +x gradlew
+            ./gradlew assembleDebug --no-daemon || ./gradlew assemble --no-daemon
+          else
+            gradle assembleDebug --no-daemon || gradle assemble --no-daemon
+          fi
+          
+      # 2. FALLBACK DE COMPILAÇÃO (Rescue Mode)
+      - name: Gradle Build (Rescue)
+        if: steps.project_info.outputs.build_system == 'gradle' && steps.gradle_build.outcome == 'failure'
+        id: gradle_rescue
+        continue-on-error: true
+        run: |
+           echo "::warning::Build Full falhou. Iniciando modo de resgate agressivo."
+           if [ -n "${{ steps.project_info.outputs.gradle_wrapper_dir }}" ]; then
+            cd ${{ steps.project_info.outputs.gradle_wrapper_dir }}
+            ./gradlew assembleDebug -x test -x lint --no-daemon || ./gradlew assemble -x test -x lint --no-daemon
+           else
+            gradle assembleDebug -x test -x lint --no-daemon || gradle assemble -x test -x lint --no-daemon
+           fi
+
+      # 3. MÁQUINA DO TEMPO (MANUAL INSTALL)
+      # Troquei a Action por 'wget' direto para evitar ETIMEDOUT na API da Action
+      - name: Manual Install Gradle 7.6.4 (Network Proof)
+        if: steps.project_info.outputs.build_system == 'gradle' && steps.gradle_rescue.outcome == 'failure'
+        id: manual_install
+        run: |
+           echo "::warning::Rescue falhou. Baixando Gradle 7.6.4 manualmente..."
+           wget -q https://services.gradle.org/distributions/gradle-7.6.4-bin.zip
+           unzip -q gradle-7.6.4-bin.zip
+           # Adiciona ao PATH para este step e os seguintes
+           echo "$PWD/gradle-7.6.4/bin" >> $GITHUB_PATH
+      
+      - name: Gradle Build (Time Machine Execution)
+        if: steps.project_info.outputs.build_system == 'gradle' && steps.gradle_rescue.outcome == 'failure'
+        run: |
+           echo "::warning::Tentando compilar com Gradle 7.6.4 (Legacy Mode)."
+           if [ -n "${{ steps.project_info.outputs.gradle_wrapper_dir }}" ]; then
+             cd ${{ steps.project_info.outputs.gradle_wrapper_dir }}
+           fi
+           # Agora o comando 'gradle' chama o binário que baixamos acima
+           gradle assembleDebug -x test -x lint --no-daemon || gradle assemble -x test -x lint --no-daemon
+
+      # 4. ANÁLISE SONAR
+      - name: SonarCloud Scan (Gradle Strategy)
+        if: steps.project_info.outputs.build_system == 'gradle'
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=grilo-org_20260120T192424_lukninja97_NodeExplorer
+            -Dsonar.projectName=20260120T192424_lukninja97_NodeExplorer
+            -Dsonar.organization=grilo-org
+            -Dsonar.java.binaries=**/build/classes,**/build/intermediates/javac,**/build/tmp/kotlin-classes
+            -Dsonar.sources=.
+            -Dsonar.tests=.
+            -Dsonar.test.inclusions=**/*Test.java,**/*Tests.java
+            -Dsonar.exclusions=**/*.class
